@@ -1,0 +1,9 @@
+{
+  "name": "my-skills",
+  "version": "1.0.0",
+  "description": "Shared skills across my projects",
+  "author": {
+    "name": "bigny"
+  },
+  "skills": "./skills/"
+}
