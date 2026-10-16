@@ -75,7 +75,7 @@ If `$ARGUMENTS` is a locale code that does **not** yet exist under `$LOCALES_ROO
 
 1. Create folder `$LOCALES_ROOT/<locale>/`
 2. Copy the structure of every JSON file from `$LOCALES_ROOT/en/` into that folder with empty string values `""` for all keys — scaffold only, do not translate yet
-3. Initialise a cache entry for this locale as `{}` in `.claude/translate/cache.json` if not already present
+3. Create `.claude/translate/cache.json` with an empty `chunks: {}` skeleton if it doesn't exist
 4. Proceed with the full translation algorithm below as if all keys are missing
 
 ---
@@ -93,18 +93,27 @@ Create `.claude/translate/` if it doesn't exist. These files are generated and u
 }
 ```
 
-**`cache.json`** — written after every run. Stores the English source value and its translation for every key translated via AI. On the next run, if a key's English value hasn't changed, the cached translation is reused — no AI call needed. Create as `{}` if it doesn't exist.
+**`cache.json`** — one file for all locales, written after every run. Tracks the English source only — chunk keys are flat dot-path keys from `en` (prefixed with namespace when multiple files exist, e.g. `translation.login.title`). The hash is SHA-256 of the English value. If the hash matches on the next run, the key hasn't changed in `en` and all existing locale translations for it are still valid — no AI call needed. Create as the skeleton below if it doesn't exist.
 
-Structure: `locale → namespace → flat dot-path key → { "source": "<en value>", "translation": "<translated>" }`
 ```json
 {
-  "pt": {
-    "translation": {
-      "login.title": { "source": "Sign in", "translation": "Entrar" }
+  "version": 1,
+  "sourceFile": "public/locales/en/translation.json",
+  "sourceLang": "en",
+  "chunks": {
+    "login.title": {
+      "hash": "2cb537852dcb546f1c2d1523d708d50c334d704d90187d58d4a0155e690f4392",
+      "translatedAt": "2026-06-05T10:46:06.289Z"
+    },
+    "login.description": {
+      "hash": "75ecdda22a855a5717e435b8181f52a820fe6e2bd2997c57f5fb41e19ce7dc52",
+      "translatedAt": "2026-06-05T10:46:10.881Z"
     }
   }
 }
 ```
+
+`translatedAt` records when the AI last translated this key across all locales. When a key's hash changes, it is re-translated into every target locale and `translatedAt` is updated.
 
 **`context.md`** — auto-generated on first run. Contains the app description used as translation context. Never overwrite after the first run unless the user explicitly asks to regenerate it.
 
@@ -154,19 +163,29 @@ When translating any string, check `glossary.yaml` first. If any word or phrase 
 
 ## Algorithm
 
-For each target locale and each JSON file in `$LOCALES_ROOT/en/`:
+**Phase 1 — Diff against cache (run once, not per locale)**
 
-1. Read `$LOCALES_ROOT/en/<file>` and `$LOCALES_ROOT/<locale>/<file>` (treat a missing target file as `{}`).
-2. Read `.claude/translate/cache.json`, `$LOCALES_ROOT/glossary.yaml`, and `.claude/translate/context.md`.
-3. Walk the `en` object recursively. Collect every leaf as a flat dot-path key and its English string value.
-4. For each key, determine the result in priority order:
-   - **Glossary match** — one or more words/phrases in `en_value` match a glossary term for this locale: use the glossary translation for those terms, translate the rest with AI. No cache write for the glossary portion.
-   - **Cache hit** — `cache[locale][namespace][key]` exists AND `.source === en_value`: use `.translation`. No AI call.
-   - **Cache miss or source changed** — translate `en_value` using the app context from `context.md` and any matching glossary terms. Keep `{{var}}` tokens, `<tag>` markup, and HTML entities untouched — translate surrounding text only. Write `{ source: en_value, translation: result }` to cache.
-5. Keys present in the target file but absent from `en`: delete them.
-6. Reconstruct the target JSON with the same nested structure and key order as `en`.
-7. Write the target file with 2-space indentation and a trailing newline.
-8. Merge cache updates into `.claude/translate/cache.json` — add/overwrite AI-translated keys, remove keys no longer in `en`, leave other locales untouched.
+1. Read `.claude/translate/cache.json`, `$LOCALES_ROOT/glossary.yaml`, and `.claude/translate/context.md`.
+2. For each JSON file in `$LOCALES_ROOT/en/`, walk the object recursively and collect every leaf as a flat chunk key (`<namespace>.<dot-path>`) and its English string value.
+3. For each chunk key, classify it:
+   - **Unchanged** — `chunks[key]` exists in `cache.json` AND `.hash === sha256(en_value)`. No AI call needed for any locale.
+   - **Changed or new** — hash missing or mismatched. Must be re-translated into all target locales.
+   - **Removed** — present in `cache.json` but absent from current `en` files. Remove from cache and from all locale files.
+
+**Phase 2 — Translate changed keys (AI calls)**
+
+4. For all *changed or new* keys, translate each `en_value` into every target locale in a single batch where possible. Apply rules:
+   - Check `glossary.yaml` first — use pinned terms for that locale, translate the rest with AI.
+   - Keep `{{var}}` tokens, `<tag>` markup, and HTML entities untouched — translate surrounding text only.
+   - Keys classified as *unchanged* receive no AI call.
+
+**Phase 3 — Write outputs**
+
+5. For each target locale and each JSON file:
+   - Merge results: unchanged keys → keep existing value from the locale file; changed/new keys → use the new translation from Phase 2; removed keys → delete.
+   - Reconstruct the JSON with the same nested structure and key order as `en`.
+   - Write the file with 2-space indentation and a trailing newline.
+6. Write `.claude/translate/cache.json` — update chunks for all changed/new keys with `{ hash: sha256(en_value), translatedAt: <current ISO 8601 timestamp> }`, remove chunks for deleted keys, leave unchanged chunks untouched.
 
 **Never touch `$LOCALES_ROOT/en/*`** — it is the source, never the target.  
 **Never modify `glossary.yaml`** — it is developer-managed.
