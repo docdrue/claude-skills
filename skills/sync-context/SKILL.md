@@ -1,20 +1,22 @@
 ---
 name: sync-context
-description: Syncs CLAUDE.md with current project state — detects what changed since last sync, updates relevant sections, and writes all sync history and markers to .claude/sync-history.md. CLAUDE.md stays clean and minimal — never modified by this skill except to correct genuinely stale technical info. Invoke at session start and whenever significant code changes are made.
-version: 1.0.0
+description: Syncs CLAUDE.md with current project state — detects what changed since last sync, updates relevant sections, and appends sync history to .claude/sync-history.md (the per-branch sync marker lives in the gitignored .claude/.sync-state). CLAUDE.md stays clean and minimal — never modified by this skill except to correct genuinely stale technical info. Invoke at session start and whenever significant code changes are made.
+version: 1.1.0
 user-invocable: true
 argument-hint: "[check|force]"
 ---
 
 # sync-context
 
-Keeps CLAUDE.md accurate without polluting it with history. All sync tracking lives in `.claude/sync-history.md`.
+Keeps CLAUDE.md accurate without polluting it with history. The human-readable log lives in `.claude/sync-history.md` (committed, append-only, newest at the bottom). The volatile "last synced" marker lives in `.claude/.sync-state` (gitignored, per-checkout).
+
+> **Why the split?** Earlier versions stored the `last-synced` marker at the top of `.claude/sync-history.md` and prepended new entries there too. Because every sync on every branch rewrote those same top lines to a different commit SHA, merging `dev → stage → master` produced a conflict *every time*. Keeping the marker out of the committed file and only ever appending to the bottom of the log means branches never edit the same region, so merges are automatic. A `merge=union` rule (see setup) guarantees it even when two branches append at once.
 
 ---
 
 ## One-time project setup
 
-When this skill is first used in a project, check for the following. If either is missing, add it and tell the user.
+When this skill is first used in a project, check for the following. If any is missing, add it and tell the user.
 
 **1. Hook in `.claude/settings.json`** — triggers the skill automatically every session:
 
@@ -47,6 +49,22 @@ Preserve any existing keys — only merge in the `SessionStart` hook if it isn't
 ```
 
 Add this only if CLAUDE.md doesn't already have a session protocol section.
+
+**3. Union-merge rule in `.gitattributes`** (project root) — makes concurrent appends to the log merge without conflicts:
+
+```
+.claude/sync-history.md merge=union
+```
+
+Create `.gitattributes` if missing, or append this line if it isn't already present. `union` is a built-in git merge driver — no extra config needed; it just has to be committed so every checkout picks it up.
+
+**4. Ignore the local marker in `.gitignore`** (project root) — the sync marker is per-checkout state and must never be committed or merged:
+
+```
+.claude/.sync-state
+```
+
+Create `.gitignore` if missing, or append this line if it isn't already present. If `.claude/.sync-state` was ever committed by an older version, untrack it once: `git rm --cached .claude/.sync-state`.
 
 ---
 
@@ -83,14 +101,16 @@ Check whether `CLAUDE.md` exists and contains meaningful content (more than just
 
 ## Step 1 — Find the last sync point
 
-Read `.claude/sync-history.md` and look for the most recent marker at the top of the file:
+Read `.claude/.sync-state` (gitignored, local to this checkout). It contains a single marker line:
 
 ```
-<!-- last-synced: <commit-sha> <YYYY-MM-DD> -->
+last-synced: <commit-sha> <YYYY-MM-DD>
 ```
 
-- If the marker exists, capture `<commit-sha>` as `$LAST_SHA` and `<YYYY-MM-DD>` as `$LAST_DATE`.
-- If the file doesn't exist or has no marker, this is the first run — set `$LAST_SHA` to empty.
+- If the file exists, capture `<commit-sha>` as `$LAST_SHA` and `<YYYY-MM-DD>` as `$LAST_DATE`.
+- If the file doesn't exist or has no marker, treat this as the first run for this checkout — set `$LAST_SHA` to empty. (A fresh clone has no `.sync-state`, so its first sync scans from the start — that's expected and harmless.)
+
+Never read the sync marker from `.claude/sync-history.md` — that file is the committed log only and no longer carries the marker.
 
 ## Step 2 — Diff against HEAD
 
@@ -147,12 +167,24 @@ For each affected section:
 
 Never add sync markers, timestamps, or changelog entries to CLAUDE.md.
 
-## Step 6 — Write to .claude/sync-history.md
+## Step 6 — Write the log and the marker
 
-Create `.claude/` if it doesn't exist. For each major change:
+Create `.claude/` if it doesn't exist.
+
+**6a. Ensure the log has its fixed header.** If `.claude/sync-history.md` does not exist, create it with exactly this header and nothing else yet:
+
+```markdown
+# Sync History
+
+<!-- Append-only. Newest entries at the bottom. Do NOT edit existing entries or insert at the top — that causes merge conflicts. The per-branch sync marker lives in .claude/.sync-state (gitignored). -->
+```
+
+This header never changes after creation, so the top of the file stays byte-identical across all branches — merges only ever touch the appended tail.
+
+**6b. Append each major change to the BOTTOM of the log.**
 
 1. Infer reasoning from commit messages, code comments, and PR/issue references. If the "why" cannot be found, write exactly: `not documented in commit history` — never invent a reason.
-2. Format each entry:
+2. Format each entry (one blank line before it):
 
 ```
 YYYY-MM-DD — <short title (≤60 chars)>
@@ -161,18 +193,17 @@ Why: <reasoning from commits/comments, or "not documented in commit history">
 Affects: <comma-separated CLAUDE.md sections updated>
 ```
 
-3. Place new entries **below** the `<!-- last-synced -->` marker, **above** existing entries (newest first).
-4. Update (or create) the marker at the very top of `.claude/sync-history.md`:
+3. Append new entries at the **end** of the file (oldest-first overall, so the newest entry is always last). **Never** insert at the top and **never** edit or delete existing entries — append only. This is what keeps the file auto-mergeable.
+
+**6c. Write the marker to `.claude/.sync-state`** (overwrite the whole file — it is gitignored, so this never affects a merge):
 
 ```
-<!-- last-synced: <current HEAD sha> <YYYY-MM-DD> -->
+last-synced: <current HEAD sha> <YYYY-MM-DD>
 ```
-
-Never delete or rewrite existing entries — only append or compress.
 
 ## Step 7 — Compress old entries if needed
 
-If `.claude/sync-history.md` exceeds 30 entries, summarize all but the 20 most recent into:
+If `.claude/sync-history.md` exceeds 30 entries, summarize all but the 20 **most recent** (i.e. the oldest entries, which sit just under the header) into this block, placed directly **below the header and above the remaining raw entries**:
 
 ```markdown
 ## Earlier history
@@ -181,7 +212,9 @@ Summarized N entries from <oldest-date> to <cutoff-date>:
 - <one-line summary per major theme or time period>
 ```
 
-Replace the raw old entries with this block. Never compress any of the 20 most recent.
+Replace the raw old entries with this block. Never compress any of the 20 most recent (the newest, at the bottom).
+
+> **Merge note:** Compression rewrites existing lines, which is the one operation that can still conflict. Only compress on your long-lived integration branch (e.g. `master`), never on a short-lived `dev`/`stage` branch you're about to promote, and let the result flow downstream normally. Routine syncs only ever append, so they stay conflict-free.
 
 ---
 
